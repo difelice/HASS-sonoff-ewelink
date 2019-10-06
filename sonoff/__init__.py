@@ -26,6 +26,7 @@ DOMAIN              = "sonoff"
 REQUIREMENTS        = ['uuid', 'websocket-client==0.54.0']
 
 import websocket
+from .utils import gen_nonce
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -90,9 +91,9 @@ class Sonoff():
             self._username = self._email.strip()
 
         self._skipped_login = 0
-        self._grace_period  = timedelta(seconds=config.get(DOMAIN, {}).get(CONF_GRACE_PERIOD,''))
 
         self._devices       = []
+        self._registered    = False
         self._user_apikey   = None
         self._ws            = None
         self._wshost        = None
@@ -118,23 +119,31 @@ class Sonoff():
         return self._entity_prefix
 
     def do_login(self):
-
         import uuid
+        import urllib.parse
 
         # reset the grace period
         self._skipped_login = 0
 
+        self._api_app_id = 'oeVkj2lYFGnJu5XUtWisfW4utiN4u9Mq'
+        self._api_app_version = '3.11.0'
+        self._api_imei = str(uuid.uuid4())
+        self._api_model = urllib.parse.quote('iPhone XS_iPhone11,2')
+        self._api_nonce = gen_nonce()
+        self._api_rom_version = '13.1.2'
+        self._api_version = 6
+
         app_details = {
             'password'  : self._password,
-            'version'   : '6',
+            'version'   : str(self._api_version),
             'ts'        : int(time.time()),
-            'nonce'     : ''.join([str(random.randint(0, 9)) for i in range(15)]),
-            'appid'     : 'oeVkj2lYFGnJu5XUtWisfW4utiN4u9Mq',
-            'imei'      : str(uuid.uuid4()),
+            'nonce'     : self._api_nonce,
+            'appid'     : self._api_app_id,
+            'imei'      : self._api_imei,
             'os'        : 'iOS',
-            'model'     : 'iPhone10,6',
-            'romVersion': '11.1.2',
-            'appVersion': '3.5.3'
+            'model'     : self._api_model,
+            'romVersion': self._api_rom_version,
+            'appVersion': self._api_app_version,
         }
 
         if re.match(r'[^@]+@[^@]+\.[^@]+', self._username):
@@ -344,6 +353,26 @@ class Sonoff():
         self.write_debug(data, type='s')
 
     def update_devices(self):
+        """
+        Fetch list of devices.
+
+        Sampled on 06/Oct/2019:
+
+        GET https://as-api.coolkit.cc:8080/api/user/device?lang=en
+            &apiKey=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&getTags=1
+            &version=6&ts=1570374772&nonce=sqeqid6b
+            &appid=oeVkj2lYFGnJu5XUtWisfW4utiN4u9Mq
+            &imei=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&os=iOS
+            &model=iPhone%20XS_iPhone11%2C2&romVersion=13.1.2
+            &appVersion=3.11.0 HTTP/1.1
+
+        Response structure:
+        {
+            "error": 0,
+            "devicelist": [...]
+        }
+
+        """
         if self.get_user_apikey() is None:
             _LOGGER.error("Initial login failed, devices cannot be updated!")
             return self._devices
@@ -353,13 +382,33 @@ class Sonoff():
             _LOGGER.info("Grace period active")
             return self._devices
 
-        r = requests.get('https://{}-api.coolkit.cc:8080/api/user/device?lang=en&apiKey={}&getTags=1'.format(self._api_region, self.get_user_apikey()),
-            headers=self._headers)
+        # Note: maybe not all the parameters are required, but better to mimic
+        # the app call as it is.
+        params = {
+            'lang'          : 'en',
+            'apiKey'        : self.get_user_apikey(),
+            'getTags'       : 1,
+            'version'       : self._api_version,
+            'ts'            : str(int(time.time())),
+            'nonce'         : self._api_nonce,
+            'appid'         : self._api_app_id,
+            'imei'          : self._api_imei,
+            'os'            : 'iOS',
+            'model'         : self._api_model,
+            'romVersion'    : self._api_rom_version,
+            'appVersion'    : self._api_app_version,
+        }
+
+        r = requests.get('https://{}-api.coolkit.cc:8080/api/user/device'.format(self._api_region),
+            params=params,
+            headers=self._headers,
+        )
 
         resp = r.json()
         if 'error' in resp and resp['error'] in [HTTP_BAD_REQUEST, HTTP_UNAUTHORIZED]:
+            _LOGGER.debug("Error updating devices: {}".format(r.text))
             # @IMPROVE add maybe a service call / switch to deactivate sonoff component
-            if self.is_grace_period():
+            if self._registered and self.is_grace_period():
                 _LOGGER.warning("Grace period activated!")
 
                 # return the current (and possible old) state of devices
@@ -369,7 +418,9 @@ class Sonoff():
             _LOGGER.info("Re-login component")
             self.do_login()
 
-        self._devices = r.json()
+        self._devices = r.json().get('devicelist', self._devices)
+        # Devices registered in HA.
+        self._registered = True
 
         self.write_debug(r.text, type='D')
 
@@ -399,7 +450,7 @@ class Sonoff():
         return self._wshost
 
     async def async_update(self):
-        devices = self.update_devices()
+        self.update_devices()
 
     def get_outlets(self, device):
         # information found in ewelink app source code
@@ -574,8 +625,8 @@ class WebsocketListener(threading.Thread, websocket.WebSocketApp):
             'action'    : "userOnline",
             'userAgent' : 'app',
             'version'   : 6,
-            'nonce'     : ''.join([str(random.randint(0, 9)) for i in range(15)]),
-            'apkVesrion': "1.8",
+            'nonce'     : gen_nonce(),
+            'apkVersion': "1.8",
             'os'        : 'ios',
             'at'        : self._sonoff.get_bearer_token(),
             'apikey'    : self._sonoff.get_user_apikey(),
@@ -597,6 +648,7 @@ class WebsocketListener(threading.Thread, websocket.WebSocketApp):
                                             sslopt=sslopt,
                                             ping_interval=ping_interval,
                                             ping_timeout=ping_timeout)
+
 
 class SonoffDevice(Entity):
     """Representation of a Sonoff device"""
